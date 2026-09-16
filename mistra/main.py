@@ -1,14 +1,14 @@
 """
 Standalone entry point. Runs entirely on the Raspberry Pi with a
 monitor plugged into its own HDMI port -- no laptop, no network
-socket, no streaming. Camera capture, dynamic frame skipping, YOLOv8n
-inference, box drawing, and local display all happen in one loop.
+socket, no streaming.
 
-Dropping the network layer isn't just simpler -- it removes real
-per-frame cost (JPEG encode, socket I/O) that used to compete with
-inference for the Pi's CPU budget. The dynamic frame skipper now only
-has to answer to the local display's own refresh, not to a remote
-consumer's bandwidth.
+Capture+preprocessing run in a background thread (mistra/capture_worker.py)
+so they overlap with YOLO inference in the main thread instead of the two
+serializing on one core -- on a 4-core Pi 4 this is a real throughput win,
+not just a code reorganization. The main thread does inference, box
+drawing, and display, always working on the *latest* frame the worker has
+produced.
 
 Usage (on the Pi, with the real camera):
     python3 -m mistra.main --model yolov8n.pt --target-fps 8
@@ -21,17 +21,21 @@ machine with a display):
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
 
+import cv2
+
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from mistra import config
 from mistra.camera import CameraSource
+from mistra.capture_worker import CaptureWorker
 from mistra.detector import YOLODetector, draw_detections, empty_detections
 from mistra.display import Display
 from mistra.frame_skipper import DynamicFrameSkipper
-from mistra.preprocess import Preprocessor
+from mistra.preprocess import Preprocessor, PreprocessStats
 
 
 def round_to_stride(value: int, stride: int = 32) -> int:
@@ -45,6 +49,19 @@ def run(args: argparse.Namespace) -> None:
     detector = YOLODetector(
         weights=args.model, conf=args.conf, device=args.yolo_device, classes=classes
     )
+
+    # Thread budgeting: reserve at least one core for capture/preprocess/
+    # display so torch's inference threads don't starve them. On a 4-core
+    # Pi 4, --infer-threads defaults to 3, leaving 1 core free.
+    infer_threads = args.infer_threads
+    if infer_threads <= 0:
+        infer_threads = max(1, (os.cpu_count() or 4) - 1)
+    try:
+        import torch
+        torch.set_num_threads(infer_threads)
+    except ImportError:
+        pass
+
     skipper = DynamicFrameSkipper(
         target_fps=args.target_fps, min_scale=args.min_scale, max_skip=args.max_skip,
     )
@@ -56,18 +73,47 @@ def run(args: argparse.Namespace) -> None:
 
     print(f"[mistra] running standalone ({args.width}x{args.height}, "
           f"model={args.model}, target_fps={args.target_fps}, "
-          f"headless={args.headless})")
+          f"infer_threads={infer_threads}, headless={args.headless})")
+
+    # Warm up the model with one throwaway inference call before the loop
+    # (and its timers) start. The first call into a freshly-loaded YOLO
+    # model pays a one-time cost -- backend init, memory allocation, any
+    # lazy graph construction -- that can run into the seconds and has
+    # nothing to do with steady-state inference speed. Without this, that
+    # cost lands inside the frame_skipper's rolling average and distorts
+    # its imgsz/skip decisions (and your benchmark numbers) for the first
+    # several frames.
+    print("[mistra] warming up model...")
+    warm_frame = camera.read()
+    warm_frame, _ = preprocessor.apply(warm_frame)
+    warm_imgsz = round_to_stride(int(args.base_imgsz * skipper.scale))
+    detector.run(warm_frame, imgsz=warm_imgsz)
+    print("[mistra] model warmed up")
+
+    worker = CaptureWorker(
+        camera, preprocessor, max_capture_fps=args.max_capture_fps,
+        cv2_threads=args.capture_cv2_threads,
+    ).start()
 
     last_detections = empty_detections()
+    last_prep_stats = PreprocessStats()
     frame_id = 0
+    processed_frame_id = -1
     loop_times: list[float] = []
 
     try:
         while True:
-            loop_start = time.time()
-            frame = camera.read()
-            frame, prep_stats = preprocessor.apply(frame)
+            worker.raise_if_failed()
+            captured = worker.get_latest()
+            if captured is None or captured.frame_id == processed_frame_id:
+                time.sleep(0.002)
+                continue
+            processed_frame_id = captured.frame_id
+            frame = captured.image
+            last_prep_stats = captured.prep_stats
+            pipeline_lag_ms = (time.time() - captured.captured_at) * 1000
 
+            loop_start = time.time()
             inference_ms = 0.0
             imgsz_used = 0
             skipped = True
@@ -87,13 +133,13 @@ def run(args: argparse.Namespace) -> None:
             loop_fps = len(loop_times) / total_time if total_time > 0 else 0.0
 
             hud = [
-                f"preprocess={prep_stats.total_ms:.1f}ms "
-                f"(denoise={prep_stats.denoise_ms:.1f} clahe={prep_stats.clahe_ms:.1f} "
-                f"dehaze={prep_stats.dehaze_ms:.1f})",
+                f"preprocess={last_prep_stats.total_ms:.1f}ms "
+                f"(denoise={last_prep_stats.denoise_ms:.1f} clahe={last_prep_stats.clahe_ms:.1f} "
+                f"dehaze={last_prep_stats.dehaze_ms:.1f})",
                 f"infer={inference_ms:.1f}ms imgsz={imgsz_used} skipped={skipped} "
                 f"dets={len(last_detections.boxes)}",
                 f"skip_n={skipper.skip} scale={skipper.scale:.2f} "
-                f"loop_fps={loop_fps:.1f} frame={frame_id}",
+                f"loop_fps={loop_fps:.1f} pipeline_lag={pipeline_lag_ms:.0f}ms frame={frame_id}",
             ]
             if display is not None:
                 if not display.show(annotated, hud):
@@ -101,23 +147,20 @@ def run(args: argparse.Namespace) -> None:
                     break
             else:
                 if frame_id % int(max(1, args.target_fps)) == 0 or not skipped:
-                    print(f"[mistra #{frame_id:04d}] fps={loop_fps:.1f} | "
+                    print(f"[mistra #{frame_id:04d}] loop_fps={loop_fps:.1f} | "
                           f"infer={inference_ms:.1f}ms (imgsz={imgsz_used}) | "
-                          f"prep={prep_stats.total_ms:.1f}ms | "
+                          f"prep={last_prep_stats.total_ms:.1f}ms | "
+                          f"lag={pipeline_lag_ms:.0f}ms | "
                           f"dets={len(last_detections.boxes)}", flush=True)
 
             frame_id += 1
             if args.max_frames > 0 and frame_id >= args.max_frames:
                 print(f"[mistra] reached max frames ({args.max_frames}), shutting down", flush=True)
                 break
-
-            elapsed = time.time() - loop_start
-            sleep_for = (1.0 / args.max_capture_fps) - elapsed
-            if sleep_for > 0:
-                time.sleep(sleep_for)
     except KeyboardInterrupt:
         print("\n[mistra] shutting down")
     finally:
+        worker.stop()
         camera.release()
         if display is not None:
             display.close()
@@ -130,7 +173,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--width", type=int, default=config.DEFAULT_WIDTH)
     p.add_argument("--height", type=int, default=config.DEFAULT_HEIGHT)
     p.add_argument("--max-capture-fps", type=float, default=config.DEFAULT_CAPTURE_FPS,
-                    help="hard cap on the capture/infer/display loop rate")
+                    help="hard cap on the background capture/preprocess worker's rate")
     p.add_argument("--camera-device", type=int, default=0, dest="device",
                     help="OpenCV VideoCapture index, used only if picamera2 is unavailable")
     p.add_argument("--synthetic", action="store_true",
@@ -145,6 +188,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-frames", type=int, default=0,
                     help="stop after processing N frames (0 = run indefinitely, useful for benchmarks)")
 
+    p.add_argument("--infer-threads", type=int, default=0,
+                    help="torch CPU threads for YOLO inference (0 = auto: cpu_count-1, "
+                         "reserving one core for capture/preprocess/display)")
+    p.add_argument("--capture-cv2-threads", type=int, default=1,
+                    help="OpenCV thread pool size inside the capture/preprocess worker "
+                         "(kept low by default so it doesn't compete with inference threads)")
+
     p.add_argument("--no-denoise", dest="denoise", action="store_false",
                     help="disable bilateral-filter noise reduction (on by default)")
     p.add_argument("--denoise-strength", type=int, default=5,
@@ -158,7 +208,9 @@ def parse_args() -> argparse.Namespace:
                          "experimental, validate on real IR footage before trusting it)")
     p.set_defaults(denoise=True, clahe=True)
 
-    p.add_argument("--model", default="yolov8n.pt", help="ultralytics weights path/name")
+    p.add_argument("--model", default="yolov8n.pt",
+                    help="ultralytics weights path/name -- also accepts an exported "
+                         "NCNN/ONNX model directory (see tools/export_ncnn.py)")
     p.add_argument("--conf", type=float, default=0.35)
     p.add_argument("--yolo-device", default="cpu", dest="yolo_device",
                     help="'cpu', 'cuda', or a device index -- 'cpu' for a stock Raspberry Pi")

@@ -10,10 +10,16 @@ we need in order to know what to optimise before adding radar/GNSS
 fusion on top.
 
 ```
-Pi camera → capture → noise reduction → CLAHE → [dehaze, opt-in]
-          → dynamic skip/scale decision → YOLOv8n (Pi CPU) → draw boxes
-          → local HDMI display (Pi's own monitor)
+[background thread] Pi camera → capture → noise reduction → CLAHE → [dehaze, opt-in]
+                                                                         ↓
+[main thread]                          dynamic skip/scale decision → YOLOv8n (Pi CPU)
+                                        → draw boxes → local HDMI display
 ```
+
+Capture+preprocessing run continuously in a background thread
+(`mistra/capture_worker.py`); the main thread always inferences on the
+*latest* frame that thread has produced, rather than the two stages
+serializing on a single core.
 
 Dropping the network layer isn't just simpler — it removes real
 per-frame cost (JPEG encode, socket I/O) that used to compete with
@@ -30,10 +36,13 @@ mistra-vision/
 │   ├── config.py            # shared defaults (resolution, capture fps)
 │   ├── camera.py            # picamera2 / USB webcam / synthetic test source
 │   ├── preprocess.py        # noise reduction, CLAHE, optional DCP dehazing
+│   ├── capture_worker.py    # background capture+preprocess thread (pipelining)
 │   ├── detector.py          # YOLOv8n wrapper + box-drawing
 │   ├── frame_skipper.py     # dynamic skip + adaptive resolution controller
 │   ├── display.py           # local HDMI display window + stats HUD
 │   └── main.py              # capture → preprocess → infer → display (entry point)
+├── tools/
+│   └── export_ncnn.py       # one-time helper: export .pt → NCNN for faster Pi inference
 └── tests/
     └── test_preprocess.py   # preprocessing step tests (cv2/numpy only)
 ```
@@ -158,6 +167,92 @@ alongside the inference stats, since this cost runs on every frame
 regardless of the dynamic skipper — worth seeing on its own when
 deciding what to trim.
 
+## Getting more FPS on a Raspberry Pi 4 (4GB)
+
+**Set expectations honestly first.** Published benchmarks make clear that
+stable 30 FPS full-frame YOLO detection on a Pi 4 is not realistic, no
+matter how the software is tuned:
+
+- Q-engineering's hand-written **C++ NCNN** benchmark gets YOLOv8n @
+  640×640 to **~14.5 FPS** on a Pi 4 — and that's inference time only
+  (no capture/preprocess/draw/display counted), and on a Pi
+  **overclocked to 1950MHz** (stock is 1500MHz).
+- A real user exporting through **ultralytics' own Python NCNN wrapper**
+  on a stock Pi 4B reported only **~1.7–2 FPS**
+  ([ultralytics/ultralytics#12996](https://github.com/ultralytics/ultralytics/issues/12996))
+  — barely different from plain PyTorch. The Python wrapper doesn't
+  reach the hand-written C++ numbers.
+
+So: 30 FPS of genuine per-frame detection at full resolution isn't a
+software tuning problem to solve, it's a hardware ceiling. What's
+realistic to chase instead:
+
+1. **Separate detection rate from display rate.** The dynamic skipper
+   already redraws the *last known* boxes onto every new frame, even
+   skipped ones — the screen can look smooth at a much higher rate than
+   YOLO itself is actually re-detecting at. If the driver-facing
+   requirement is really "smooth, responsive-looking video with
+   reasonably fresh boxes," that's a materially easier target than "30
+   fresh YOLO passes per second," and it's already what this pipeline
+   does.
+2. **Overlap capture/preprocess with inference (done — `capture_worker.py`).**
+   Previously the loop was capture → preprocess → infer → draw, fully
+   serial on one core. Now capture+preprocess run continuously in a
+   background thread, so on a 4-core Pi 4 that stage overlaps with YOLO
+   inference instead of adding to it. `pipeline_lag` in the HUD is the
+   number to watch — if it stays low, the overlap is working.
+3. **Reserve a core for capture/display (done — `--infer-threads`).**
+   Defaults to `cpu_count - 1` (3 on a Pi 4) so torch doesn't pull all 4
+   cores and starve the capture thread. `--capture-cv2-threads` keeps
+   OpenCV's own thread pool out of that fight too. Both are worth
+   sweeping on your actual Pi — the right split depends on what else is
+   running.
+4. **Quantize — INT8 yes, INT4 no (`tools/export_ncnn.py`).** Tested
+   directly against the installed ultralytics version, not assumed:
+   - **NCNN does not support INT8 export here** (`quantize=8` is
+     rejected outright for this format) — only FP16/FP32. Some older
+     docs/discussions say otherwise; that's not what this version's
+     exporter actually does.
+   - **LiteRT (TFLite/XNNPACK)** is the real INT8-on-plain-ARM-CPU path
+     — it's in ultralytics' actual INT8-capable format list, the others
+     there (ONNX, OpenVINO, TensorRT, CoreML, IMX, RKNN, Hailo...) target
+     hardware a Pi 4 doesn't have.
+   - **INT4 isn't offered by any ultralytics export target** — checked
+     the exporter source directly; every format's valid precisions
+     top out at INT8 (`8`, `16`, `w8a16`, `w8a32`), nothing lower. This
+     matches published results elsewhere: one 2025 study quantizing
+     detectors to INT4 on ARM/edge hardware found it "practically
+     unusable due to high latency and lack of runtime support" despite
+     looking fine in simulation
+     ([source](https://openreview.net/pdf?id=legjTSXjbD)). INT8 is the
+     practical floor here, not a stepping stone to something smaller.
+   - INT8 **does cost some accuracy**, and calibration matters:
+     ultralytics itself warns when a calibration set is too small
+     (it wants 300+ images). Calibrating on generic COCO photos
+     doesn't reflect your actual fog/haze/IR conditions — build a
+     calibration set from representative footage before trusting a
+     deployed INT8 model, not just for a pipeline smoke-test.
+   - Do the LiteRT export on a laptop/PC, not the Pi — it pulls in a
+     heavy conversion toolchain (torch, jax, ~1GB+ of downloads) that
+     the Pi doesn't need just to *run* the resulting model. NCNN's FP16
+     export is much lighter and fine to run on-device.
+5. **Push `--base-imgsz` down further.** The skipper already adapts
+   resolution automatically, but its starting point (640) is expensive.
+   FLOPs scale roughly with resolution squared, so 640→320 is a ~4x
+   compute drop for a detection task that's mainly about *nearby*
+   obstacles in fog — you likely don't need long-range small-object
+   resolution here. Try `--base-imgsz 320` or `416` as your baseline,
+   not just the floor the skipper falls back to under load.
+6. **Overclocking is a legitimate lever, separate from any of this code.**
+   The Raspberry Pi Foundation supports modest official overclocks on
+   the Pi 4 (with adequate cooling) — the Q-engineering C++ number above
+   was measured at 1950MHz, not stock. Not something this project can do
+   for you, but worth knowing the cited benchmark already assumes it.
+
+None of this is a promise of a specific number — benchmark each change
+on the real hardware, one at a time, with `--headless --max-frames N`,
+and keep whatever the numbers actually show.
+
 ## Key CLI flags (`mistra/main.py`)
 
 | Flag | Default | Meaning |
@@ -173,6 +268,11 @@ deciding what to trim.
 | `--dehaze` | off | enable DCP dehazing — experimental, see above |
 | `--windowed` | off (fullscreen) | show the display in a normal window instead of fullscreen |
 | `--synthetic` | off | no-camera test mode |
+| `--headless` | off | no GUI window; print benchmark telemetry to the terminal |
+| `--max-frames` | 0 (run forever) | stop after N frames — useful for repeatable benchmarks |
+| `--infer-threads` | 0 (auto: cpu_count-1) | torch CPU threads for YOLO inference |
+| `--capture-cv2-threads` | 1 | OpenCV thread pool size inside the capture/preprocess worker |
+| `--model` | `yolov8n.pt` | also accepts an NCNN/ONNX export directory (see `tools/export_ncnn.py`) |
 
 Run `python3 -m mistra.main --help` for the full list.
 
