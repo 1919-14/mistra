@@ -204,5 +204,3 @@ Per the project's own guidance: treat everything here as **prototype /
 being benchmarked**, not "validated." The `loop_fps` and `infer`
 numbers you'll see in the on-screen HUD depend heavily on which Pi
 model you run this on — report them as measured, not projected.
-#   m i s t r a  
- 

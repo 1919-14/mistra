@@ -1,0 +1,17 @@
+opencv-python>=4.8
+numpy>=1.24
+ultralytics>=8.2
+
+# Note: opencv-python (NOT opencv-python-headless) is required -- this
+# build needs cv2.imshow/HighGUI to render to the Pi's own HDMI output.
+# The headless wheel omits GUI support entirely and cv2.imshow will
+# fail at runtime.
+#
+# ultralytics pulls in torch/torchvision automatically. On a stock
+# Raspberry Pi OS (64-bit) these can take a while to build/install --
+# see README.md for Pi-specific install notes and lighter alternatives
+# (e.g. exporting to NCNN/ONNX) once you've benchmarked the baseline.
+#
+# For the real Pi Camera Module (not a USB webcam), also install the
+# camera driver via apt (NOT pip, it ships as a system package):
+#   sudo apt install -y python3-picamera2
