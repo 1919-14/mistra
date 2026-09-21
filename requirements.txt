@@ -1,7 +1,7 @@
 opencv-python>=4.8
 numpy>=1.24
 ultralytics>=8.2
-picamera2
+
 
 # Note: opencv-python (NOT opencv-python-headless) is required -- this
 # build needs cv2.imshow/HighGUI to render to the Pi's own HDMI output.
