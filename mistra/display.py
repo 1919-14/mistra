@@ -76,7 +76,7 @@ class Display:
         for i, line in enumerate(lines):
             y = 24 + i * 26
             cv2.putText(frame, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5, (0, 255, 0), 1, cv2.LINE_AA)
+                        0.5, (0, 0, 255), 1, cv2.LINE_AA)
 
         cv2.imshow(self.window_name, frame)
         key = cv2.waitKey(1) & 0xFF

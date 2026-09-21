@@ -70,7 +70,7 @@ class YOLODetector:
         return det
 
 
-_BOX_COLOR = (60, 220, 60)
+_BOX_COLOR = (0, 255, 0)
 
 
 def draw_detections(image: np.ndarray, det: Detections) -> np.ndarray:
