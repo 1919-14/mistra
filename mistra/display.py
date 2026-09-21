@@ -74,9 +74,7 @@ class Display:
         frame = image.copy()
         lines = [f"display fps: {self.display_fps:.1f}"] + hud_lines
         for i, line in enumerate(lines):
-            y = 20 + i * 20
-            cv2.putText(frame, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5, (0, 0, 0), 3, cv2.LINE_AA)
+            y = 24 + i * 26
             cv2.putText(frame, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX,
                         0.5, (0, 255, 0), 1, cv2.LINE_AA)
 
